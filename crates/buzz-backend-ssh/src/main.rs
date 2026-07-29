@@ -89,6 +89,19 @@ fn info() -> Value {
         // secret / password / token / key / credential — camelCase included. So
         // nothing here can be a credential, which is correct: ssh already has
         // your key, and the agent's own key arrives in the deploy payload.
+        // Every default here is NON-EMPTY on purpose, and it is a workaround
+        // rather than a preference.
+        //
+        // `WhereToRunSection`'s probe effect lists `draft` in its dependency
+        // array and then calls `onDraftChange` with
+        // `providerConfig: <schema defaults>`. So editing a field changes the
+        // draft, which re-runs the effect, which overwrites the field with its
+        // default — typing into it does nothing at all. With a default of `""`
+        // the value is wiped; with a usable default the reset writes something
+        // that works, and the form appears to behave.
+        //
+        // Upstream fix is to drop `draft` from the deps (or reset only on a
+        // provider CHANGE). Until then, ship defaults a user can live with.
         "config_schema": {
             "type": "object",
             "required": ["ssh_host"],
@@ -97,7 +110,7 @@ fn info() -> Value {
                     "type": "string",
                     "title": "Host",
                     "description": "user@host, as ssh would take it. Uses your existing ssh config and identity; nothing new is exposed to the network. The host needs buzz-host and buzz-acp installed.",
-                    "default": ""
+                    "default": "uni@uni"
                 },
                 "buzz_host_bin": {
                     "type": "string",
@@ -472,5 +485,30 @@ mod tests {
     #[test]
     fn shell_quoting_survives_a_path_with_a_quote_in_it() {
         assert_eq!(shell_quote("/a'b"), r"'/a'\''b'");
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn every_default_is_non_empty_or_the_field_cannot_be_edited() {
+        // Not style. The desktop's probe effect depends on `draft` and then
+        // sets `providerConfig` to the schema defaults, so every keystroke is
+        // overwritten by the default — and a default of "" means the field can
+        // never hold anything. A usable default is the only thing that makes
+        // the form work until that loop is fixed upstream.
+        let i = info();
+        let props = i["config_schema"]["properties"].as_object().unwrap();
+        let required = i["config_schema"]["required"].as_array().unwrap();
+        for r in required {
+            let key = r.as_str().unwrap();
+            let default = props[key]["default"].as_str().unwrap_or("");
+            assert!(
+                !default.is_empty(),
+                "required field {key:?} has an empty default, so it cannot be edited"
+            );
+        }
     }
 }
