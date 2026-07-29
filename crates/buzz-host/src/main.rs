@@ -265,6 +265,21 @@ fn exec_agent(name: &str) -> Result<()> {
 
     let mut cmd = Command::new(&program);
     cmd.args(&unit.args);
+
+    // Give the agent a PATH worth having, BEFORE the unit's own env so an
+    // explicit PATH still wins.
+    //
+    // launchd hands a job `/usr/bin:/bin:/usr/sbin:/sbin` and systemd is no
+    // better. buzz-acp then spawns its harness by name — `claude-agent-acp`,
+    // `hive-acp` — and a harness installed in the conventional place is simply
+    // not found. The failure surfaces as "agent failed to spawn: No such file
+    // or directory", which reads as a missing install rather than as a PATH
+    // that no login shell ever touched.
+    //
+    // This is exactly the sort of local knowledge that belongs here rather than
+    // in a provider on some other machine.
+    cmd.env("PATH", default_path());
+
     for (k, v) in &unit.env {
         cmd.env(k, v);
     }
@@ -280,6 +295,30 @@ fn exec_agent(name: &str) -> Result<()> {
         let status = cmd.status().with_context(|| format!("running {program}"))?;
         std::process::exit(status.code().unwrap_or(1));
     }
+}
+
+/// The PATH a supervised agent gets: the conventional install prefixes, then
+/// whatever the supervisor supplied.
+///
+/// Ordered most-specific first so a user's own `~/.local/bin` copy wins over a
+/// system one — which is where harnesses installed by hand actually live.
+fn default_path() -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(home) = home() {
+        parts.push(home.join(".local/bin").display().to_string());
+        parts.push(home.join("bin").display().to_string());
+    }
+    for p in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        parts.push(p.to_string());
+    }
+    if let Ok(existing) = std::env::var("PATH") {
+        for p in existing.split(':') {
+            if !p.is_empty() && !parts.iter().any(|q| q == p) {
+                parts.push(p.to_string());
+            }
+        }
+    }
+    parts.join(":")
 }
 
 fn remove(name: &str) -> Result<()> {
@@ -629,5 +668,39 @@ mod tests {
     #[test]
     fn the_plist_escapes_a_path_that_would_break_the_xml() {
         assert_eq!(xml_escape("/a & b/<c>"), "/a &amp; b/&lt;c&gt;");
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn the_agent_path_leads_with_the_conventional_install_prefixes() {
+        // launchd gives a job /usr/bin:/bin:/usr/sbin:/sbin, so a harness in
+        // ~/.local/bin is invisible and buzz-acp reports "No such file or
+        // directory" for a binary that is plainly installed.
+        let p = default_path();
+        let parts: Vec<&str> = p.split(':').collect();
+        assert!(parts.iter().any(|d| d.ends_with("/.local/bin")), "{p}");
+        assert!(parts.contains(&"/opt/homebrew/bin"), "{p}");
+        assert!(parts.contains(&"/usr/bin"), "{p}");
+
+        let local = parts.iter().position(|d| d.ends_with("/.local/bin")).unwrap();
+        let usr = parts.iter().position(|d| *d == "/usr/bin").unwrap();
+        assert!(local < usr, "a hand-installed harness must win over a system one: {p}");
+    }
+
+    #[test]
+    fn the_path_has_no_duplicates() {
+        // The inherited PATH overlaps the defaults; repeating entries makes
+        // `buzz-host paths` output unreadable at exactly the moment someone is
+        // using it to work out why a binary was not found.
+        let p = default_path();
+        let parts: Vec<&str> = p.split(':').collect();
+        let mut uniq = parts.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(parts.len(), uniq.len(), "{p}");
     }
 }
