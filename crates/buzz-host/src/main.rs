@@ -282,6 +282,36 @@ fn exec_agent(name: &str) -> Result<()> {
     let path = default_path();
     cmd.env("PATH", &path);
 
+    // Start the agent somewhere meaningful.
+    //
+    // launchd hands a job `/` and systemd hands it `/` too, so an agent's
+    // harness opens every session in the filesystem root. That is a bad place
+    // to work from and a worse place to read project context from: Claude Code
+    // loads a CLAUDE.md from its working directory, so an agent rooted at `/`
+    // silently gets none.
+    //
+    // `BUZZ_HOST_WORKDIR` in the unit's env chooses it, so it can be set from
+    // Buzz alongside every other agent setting. Falling back to the home
+    // directory rather than leaving `/` — a missing directory is reported
+    // rather than ignored, because silently working somewhere other than where
+    // you were told to is how an agent edits the wrong copy of a file.
+    let workdir = unit
+        .env
+        .get("BUZZ_HOST_WORKDIR")
+        .cloned()
+        .or_else(|| home().ok().map(|h| h.display().to_string()));
+    if let Some(dir) = workdir {
+        if Path::new(&dir).is_dir() {
+            cmd.current_dir(&dir);
+        } else {
+            anyhow::bail!(
+                "BUZZ_HOST_WORKDIR is {dir:?}, which is not a directory on this machine.\n\
+                 Agent: {name}\n\
+                 Create it, or unset it to start in the home directory."
+            );
+        }
+    }
+
     // Pre-flight the harness itself.
     //
     // buzz-acp spawns its harness once per agent and, when the binary is not
