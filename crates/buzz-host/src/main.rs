@@ -43,6 +43,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -278,7 +279,37 @@ fn exec_agent(name: &str) -> Result<()> {
     //
     // This is exactly the sort of local knowledge that belongs here rather than
     // in a provider on some other machine.
-    cmd.env("PATH", default_path());
+    let path = default_path();
+    cmd.env("PATH", &path);
+
+    // Pre-flight the harness itself.
+    //
+    // buzz-acp spawns its harness once per agent and, when the binary is not
+    // there, reports `agent failed to spawn: No such file or directory` once
+    // per agent and then `all N agents failed to start — cannot continue`.
+    // Nothing in that names the command it tried, so it reads as buzz-acp
+    // being broken. It is usually one of two ordinary things: the harness was
+    // never installed on THIS machine, or it is installed somewhere the
+    // supervisor's PATH does not reach.
+    //
+    // Both are worth distinguishing, and both are cheap to check here — before
+    // launching a process that will fail ten times and exit.
+    if let Some(spec) = unit.env.get("BUZZ_ACP_AGENT_COMMAND") {
+        let bin = spec.split_whitespace().next().unwrap_or(spec);
+        if !bin.is_empty() && resolve_on_path(bin, &path).is_none() {
+            anyhow::bail!(
+                "harness {bin:?} is not on this machine's PATH, so every agent would \
+                 fail to spawn.\n\
+                 Agent:    {name}\n\
+                 Searched: {path}\n\
+                 \n\
+                 Either install it here, or point the agent at a harness that is \
+                 present. An ACP harness has to exist on the machine that runs it — \
+                 a containerised one (hive-acp) brings its own, a native one \
+                 (claude-agent-acp, codex-acp) must be installed."
+            );
+        }
+    }
 
     // Tell the agent what this machine calls it.
     //
@@ -308,6 +339,27 @@ fn exec_agent(name: &str) -> Result<()> {
         let status = cmd.status().with_context(|| format!("running {program}"))?;
         std::process::exit(status.code().unwrap_or(1));
     }
+}
+
+/// Find `bin` on `path`, the way exec would.
+///
+/// An explicit path is checked as given; a bare name is searched. Executability
+/// is checked rather than mere existence, because a non-executable file fails at
+/// spawn with the same errno as a missing one.
+fn resolve_on_path(bin: &str, path: &str) -> Option<PathBuf> {
+    let executable = |p: &Path| {
+        std::fs::metadata(p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    if bin.contains('/') {
+        let p = PathBuf::from(bin);
+        return executable(&p).then_some(p);
+    }
+    path.split(':').filter(|d| !d.is_empty()).find_map(|d| {
+        let p = Path::new(d).join(bin);
+        executable(&p).then_some(p)
+    })
 }
 
 /// The PATH a supervised agent gets: the conventional install prefixes, then
@@ -639,6 +691,44 @@ impl Supervisor for Systemd {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_bare_name_is_found_on_path_and_a_missing_one_is_not() {
+        // The check that turns "all 10 agents failed to start" into a sentence
+        // naming the harness. `sh` is on every PATH this runs on.
+        assert!(resolve_on_path("sh", "/nonexistent:/bin:/usr/bin").is_some());
+        assert!(resolve_on_path("definitely-not-a-harness", "/bin:/usr/bin").is_none());
+    }
+
+    #[test]
+    fn an_explicit_path_is_used_as_given_rather_than_searched() {
+        assert!(resolve_on_path("/bin/sh", "/nowhere").is_some());
+        assert!(resolve_on_path("/bin/definitely-not-here", "/bin").is_none());
+    }
+
+    #[test]
+    fn a_file_that_is_present_but_not_executable_counts_as_missing() {
+        // It fails at spawn with the same errno as an absent one, so reporting
+        // it as present would send the reader looking in the wrong place.
+        let dir = std::env::temp_dir().join(format!("buzz-host-t{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("harness");
+        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(resolve_on_path("harness", dir.to_str().unwrap()).is_none());
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(resolve_on_path("harness", dir.to_str().unwrap()).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_injected_path_reaches_where_harnesses_are_actually_installed() {
+        // A native adapter installed by npm lands in the brew prefix, and one
+        // installed by hand lands in ~/.local/bin. Both were real cases.
+        let p = default_path();
+        assert!(p.contains("/opt/homebrew/bin"), "{p}");
+        assert!(p.contains(".local/bin"), "{p}");
+    }
     use super::*;
 
     #[test]
