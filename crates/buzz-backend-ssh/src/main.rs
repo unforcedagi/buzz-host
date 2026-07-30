@@ -175,7 +175,11 @@ fn agent_env(agent: &Value) -> Result<BTreeMap<String, String>> {
     {
         let joined: Vec<String> =
             args.iter().filter_map(|a| a.as_str().map(str::to_string)).collect();
-        env.insert("BUZZ_ACP_AGENT_ARGS".into(), joined.join(" "));
+        // COMMA. buzz-acp declares `value_delimiter = ','` on this field, so a
+        // space-joined list arrives as ONE argument: `grok agent
+        // --always-approve stdio` becomes a single token the harness rejects,
+        // and `--harness codex` becomes a flag with no value.
+        env.insert("BUZZ_ACP_AGENT_ARGS".into(), joined.join(","));
     }
 
     if let Some(m) = s("model").filter(|v| !v.is_empty()) {
