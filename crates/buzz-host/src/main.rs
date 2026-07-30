@@ -280,6 +280,19 @@ fn exec_agent(name: &str) -> Result<()> {
     // in a provider on some other machine.
     cmd.env("PATH", default_path());
 
+    // Tell the agent what this machine calls it.
+    //
+    // Nothing downstream has a per-agent name otherwise: Buzz strips the
+    // private key from the harness environment and `BUZZ_MANAGED_AGENT` is the
+    // desktop INSTANCE id, shared by every agent it runs. A harness that wants
+    // to keep per-agent state — hive naming a container, say — is left asking
+    // the user to invent an identifier and set it by hand, and two agents that
+    // are given the same one silently share everything.
+    //
+    // This costs nothing to publish and is the one identifier that is already
+    // unique per agent on this machine.
+    cmd.env("BUZZ_HOST_UNIT", name);
+
     for (k, v) in &unit.env {
         cmd.env(k, v);
     }
