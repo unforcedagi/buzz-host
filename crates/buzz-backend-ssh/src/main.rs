@@ -42,8 +42,8 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -79,9 +79,28 @@ fn run() -> Result<Value> {
 
 fn info() -> Value {
     json!({
-        "id": "ssh",
+        // The desktop validates this response against a strict ALLOWLIST —
+        // exactly {ok, name, version, protocol_version, description,
+        // config_schema} — and rejects the provider outright on any missing
+        // required field or any extra one
+        // (`desktop/src-tauri/src/managed_agents/backend.rs`,
+        // `validate_provider_info`, present in the shipped desktop-v0.5.4).
+        //
+        // This response used to carry `"id": "ssh"` and omit `ok`,
+        // `description` and `protocol_version`: four violations, so the
+        // provider could not be selected at all. The id is not wire data —
+        // discovery derives it from the filename, `buzz-backend-<id>`.
+        "ok": true,
         "name": "Another machine (over SSH)",
         "version": VERSION,
+        // The wire-contract version, and the gate that runs BEFORE the nsec is
+        // handed over. A missing value is a hard error rather than a presumed
+        // 1, deliberately: inferring compatibility for the one class of binary
+        // that never declared any would defeat the point of the gate.
+        "protocol_version": 1,
+        "description": "Runs the agent on another machine over SSH. \
+                        The remote side needs buzz-host installed; this program \
+                        is transport only and knows nothing about containers.",
         // REQUIRED. Without it the desktop renders no fields at all and every
         // value silently falls back to this program's defaults.
         //
@@ -173,8 +192,10 @@ fn agent_env(agent: &Value) -> Result<BTreeMap<String, String>> {
     if let Some(args) = agent.get("agent_args").and_then(Value::as_array)
         && !args.is_empty()
     {
-        let joined: Vec<String> =
-            args.iter().filter_map(|a| a.as_str().map(str::to_string)).collect();
+        let joined: Vec<String> = args
+            .iter()
+            .filter_map(|a| a.as_str().map(str::to_string))
+            .collect();
         // COMMA. buzz-acp declares `value_delimiter = ','` on this field, so a
         // space-joined list arrives as ONE argument: `grok agent
         // --always-approve stdio` becomes a single token the harness rejects,
@@ -194,8 +215,10 @@ fn agent_env(agent: &Value) -> Result<BTreeMap<String, String>> {
     if let Some(list) = agent.get("respond_to_allowlist").and_then(Value::as_array)
         && !list.is_empty()
     {
-        let joined: Vec<String> =
-            list.iter().filter_map(|a| a.as_str().map(str::to_string)).collect();
+        let joined: Vec<String> = list
+            .iter()
+            .filter_map(|a| a.as_str().map(str::to_string))
+            .collect();
         env.insert("BUZZ_ACP_RESPOND_TO_ALLOWLIST".into(), joined.join(","));
     }
 
@@ -243,13 +266,23 @@ fn unit_name(display: &str, relay: &str) -> String {
     let mut slug: String = display
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     while slug.contains("--") {
         slug = slug.replace("--", "-");
     }
     let slug = slug.trim_matches('-').to_string();
-    let slug = if slug.is_empty() { "agent".to_string() } else { slug };
+    let slug = if slug.is_empty() {
+        "agent".to_string()
+    } else {
+        slug
+    };
     let slug: String = slug.chars().take(40).collect();
     let slug = slug.trim_matches('-').to_string();
 
@@ -259,8 +292,17 @@ fn unit_name(display: &str, relay: &str) -> String {
 
 fn deploy(req: &Value) -> Result<Value> {
     let agent = req.get("agent").cloned().unwrap_or_else(|| json!({}));
-    let cfg = req.get("provider_config").cloned().unwrap_or_else(|| json!({}));
-    let get = |k: &str| cfg.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let cfg = req
+        .get("provider_config")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let get = |k: &str| {
+        cfg.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
 
     let host = get("ssh_host");
     if host.is_empty() {
@@ -308,7 +350,11 @@ fn deploy(req: &Value) -> Result<Value> {
 
     let mut warnings: Vec<String> = Vec::new();
     let id = out.stdout.trim();
-    let id = if id.is_empty() { name.clone() } else { id.to_string() };
+    let id = if id.is_empty() {
+        name.clone()
+    } else {
+        id.to_string()
+    };
     for line in out.stderr.lines() {
         let line = line.trim();
         if !line.is_empty() {
@@ -352,7 +398,11 @@ fn ssh_stdin(host: &str, argv: &[&str], input: &str) -> Result<Output> {
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     if !out.status.success() {
-        let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
         bail!("{host}: {detail}");
     }
     Ok(Output { stdout, stderr })
@@ -360,7 +410,12 @@ fn ssh_stdin(host: &str, argv: &[&str], input: &str) -> Result<Output> {
 
 /// ssh without trusting PATH, for the same launchd reason as everything else.
 fn find_ssh() -> Result<String> {
-    for p in ["/usr/bin/ssh", "/usr/local/bin/ssh", "/opt/homebrew/bin/ssh", "/bin/ssh"] {
+    for p in [
+        "/usr/bin/ssh",
+        "/usr/local/bin/ssh",
+        "/opt/homebrew/bin/ssh",
+        "/bin/ssh",
+    ] {
         if std::path::Path::new(p).is_file() {
             return Ok(p.to_string());
         }
@@ -392,6 +447,48 @@ mod tests {
         })
     }
 
+    /// The desktop validates `info` against a strict allowlist and refuses the
+    /// provider on any deviation — so a response that is merely *informative*
+    /// is not enough, it has to be exactly this set.
+    ///
+    /// Ported from `validate_provider_info` in the shipped desktop-v0.5.4
+    /// (`desktop/src-tauri/src/managed_agents/backend.rs`). Written because
+    /// this response carried `"id"` and omitted `ok`, `description` and
+    /// `protocol_version` — four violations at once, which made the provider
+    /// unselectable while every test here still passed.
+    #[test]
+    fn info_satisfies_the_desktops_allowlist_exactly() {
+        const ALLOWED: &[&str] = &[
+            "ok",
+            "name",
+            "version",
+            "protocol_version",
+            "description",
+            "config_schema",
+        ];
+        let i = info();
+        let object = i.as_object().expect("info must be a JSON object");
+
+        assert_eq!(
+            object.get("protocol_version").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(object.get("ok"), Some(&json!(true)));
+        for field in ["name", "version", "description"] {
+            let v = object.get(field).and_then(Value::as_str);
+            assert!(
+                v.is_some_and(|s| !s.is_empty()),
+                "missing non-empty string {field}"
+            );
+        }
+        assert!(object.get("config_schema").is_some_and(Value::is_object));
+
+        // The half that actually caught the bug: no EXTRA keys either.
+        for k in object.keys() {
+            assert!(ALLOWED.contains(&k.as_str()), "unexpected info field {k:?}");
+        }
+    }
+
     #[test]
     fn info_declares_a_schema_or_the_desktop_renders_nothing() {
         let i = info();
@@ -420,7 +517,8 @@ mod tests {
         // Losing it would be silent: the agent would come up as somebody else,
         // or on a relay nobody is watching.
         let mut p = payload();
-        p["env_vars"] = json!({"BUZZ_PRIVATE_KEY": "nsec1attacker", "BUZZ_RELAY_URL": "wss://elsewhere"});
+        p["env_vars"] =
+            json!({"BUZZ_PRIVATE_KEY": "nsec1attacker", "BUZZ_RELAY_URL": "wss://elsewhere"});
         let env = agent_env(&p).unwrap();
         assert_eq!(env["BUZZ_PRIVATE_KEY"], "nsec1example");
         assert_eq!(env["BUZZ_RELAY_URL"], "wss://buzz.unforced.dev");
@@ -458,14 +556,25 @@ mod tests {
     #[test]
     fn the_observer_is_on_because_a_remote_agent_has_no_stdio_to_watch() {
         // Off, a remote agent works perfectly and appears to do nothing.
-        assert_eq!(agent_env(&payload()).unwrap()["BUZZ_ACP_RELAY_OBSERVER"], "true");
+        assert_eq!(
+            agent_env(&payload()).unwrap()["BUZZ_ACP_RELAY_OBSERVER"],
+            "true"
+        );
     }
 
     #[test]
     fn a_name_is_stable_across_redeploys_and_distinct_per_relay() {
         let a = unit_name("Research Bot", "wss://buzz.unforced.dev");
-        assert_eq!(a, unit_name("Research Bot", "wss://buzz.unforced.dev"), "not stable");
-        assert_ne!(a, unit_name("Research Bot", "wss://other.example"), "collides across relays");
+        assert_eq!(
+            a,
+            unit_name("Research Bot", "wss://buzz.unforced.dev"),
+            "not stable"
+        );
+        assert_ne!(
+            a,
+            unit_name("Research Bot", "wss://other.example"),
+            "collides across relays"
+        );
         assert!(a.starts_with("research-bot-"), "{a}");
     }
 
@@ -474,13 +583,20 @@ mod tests {
         // It becomes a filename and a unit label on the far side, which has its
         // own validation — but producing something it will reject is a failure
         // the user cannot act on.
-        for weird in ["../../etc/passwd", "", "!!!", "Ünïcödé Bot", &"x".repeat(200)] {
+        for weird in [
+            "../../etc/passwd",
+            "",
+            "!!!",
+            "Ünïcödé Bot",
+            &"x".repeat(200),
+        ] {
             let n = unit_name(weird, "wss://r");
             assert!(!n.contains('/'), "{n}");
             assert!(!n.contains('.'), "{n}");
             assert!(n.len() <= 48, "{n} is {} chars", n.len());
             assert!(
-                n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                n.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
                 "{n}"
             );
         }
