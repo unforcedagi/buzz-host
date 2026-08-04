@@ -39,7 +39,7 @@
 //! launchd here, systemd there — and this program stays transport.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -63,12 +63,23 @@ fn main() {
 }
 
 fn run() -> Result<Value> {
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    let req: Value = if line.trim().is_empty() {
+    // Read to EOF, not one line.
+    //
+    // The contract is "one JSON object on stdin, then stdin is closed"
+    // (§Invocation) — it says nothing about newlines, and a JSON object is
+    // legally pretty-printed across many lines. `read_line` silently truncated
+    // at the first `\n`, so a multi-line request failed with
+    // `EOF while parsing a value at line 2 column 0` — an error that points at
+    // the request rather than at the reader that mangled it.
+    //
+    // Found by deploying with a pretty-printed request; the same request in
+    // compact form worked, which is what made the reader the suspect.
+    let mut input = String::new();
+    std::io::stdin().lock().read_to_string(&mut input)?;
+    let req: Value = if input.trim().is_empty() {
         json!({})
     } else {
-        serde_json::from_str(&line).context("parsing the request")?
+        serde_json::from_str(&input).context("parsing the request")?
     };
     match req.get("op").and_then(Value::as_str) {
         Some("info") => Ok(info()),
@@ -456,6 +467,30 @@ mod tests {
     /// this response carried `"id"` and omitted `ok`, `description` and
     /// `protocol_version` — four violations at once, which made the provider
     /// unselectable while every test here still passed.
+    /// A JSON object may legally be pretty-printed. `read_line` truncated at
+    /// the first newline, so a multi-line request died with
+    /// "EOF while parsing a value at line 2 column 0" — blaming the request
+    /// rather than the reader. Verified against a real deploy: the identical
+    /// payload worked in compact form and failed pretty-printed.
+    #[test]
+    fn a_pretty_printed_request_parses_the_same_as_a_compact_one() {
+        let compact = r#"{"op":"deploy","agent":{"name":"x"}}"#;
+        let pretty = "{\n  \"op\": \"deploy\",\n  \"agent\": {\n    \"name\": \"x\"\n  }\n}\n";
+
+        let a: Value = serde_json::from_str(compact).expect("compact parses");
+        let b: Value = serde_json::from_str(pretty).expect("pretty parses");
+        assert_eq!(a, b, "the two forms must be the same request");
+
+        // The reader must consume all of it. Taking only the first line of the
+        // pretty form yields a fragment that is NOT valid JSON — which is
+        // precisely the failure this guards.
+        let first_line = pretty.lines().next().unwrap();
+        assert!(
+            serde_json::from_str::<Value>(first_line).is_err(),
+            "first line alone must not parse, or this test proves nothing"
+        );
+    }
+
     #[test]
     fn info_satisfies_the_desktops_allowlist_exactly() {
         const ALLOWED: &[&str] = &[
