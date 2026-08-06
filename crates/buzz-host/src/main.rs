@@ -566,7 +566,11 @@ impl Supervisor for Launchd {
     <string>{name}</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
@@ -588,17 +592,26 @@ impl Supervisor for Launchd {
         let _ = Command::new("launchctl")
             .args(["bootout", &format!("{domain}/{label}")])
             .output();
-        let out = Command::new("launchctl")
-            .args(["bootstrap", &domain])
-            .arg(&plist_path)
-            .output()
-            .context("launchctl bootstrap")?;
-        if !out.status.success() {
-            bail!(
-                "launchctl bootstrap {}: {}",
-                plist_path.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        const BOOTSTRAP_ATTEMPTS: usize = 3;
+        for attempt in 1..=BOOTSTRAP_ATTEMPTS {
+            let out = Command::new("launchctl")
+                .args(["bootstrap", &domain])
+                .arg(&plist_path)
+                .output()
+                .context("launchctl bootstrap")?;
+            if out.status.success() {
+                break;
+            }
+            if attempt == BOOTSTRAP_ATTEMPTS {
+                bail!(
+                    "launchctl bootstrap {}: {}",
+                    plist_path.display(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            // bootout tears down the old process asynchronously, so bootstrap
+            // may briefly race with it.
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
         let _ = Command::new("launchctl")
             .args(["kickstart", "-k", &format!("{domain}/{label}")])
